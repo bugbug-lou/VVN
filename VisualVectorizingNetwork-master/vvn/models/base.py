@@ -1,0 +1,131 @@
+import copy
+import tensorflow as tf
+from losses import l2_loss
+
+class Model(object):
+    '''
+    Abstract model class from which Extractor, PSGBuilder, Decoder can inherit
+    '''
+    def __init__(self, model_func=None, name=None, trainable=True, **model_params):
+        self.name = name or type(self).__name__
+        self.params = copy.deepcopy(model_params)
+        self.trainable = trainable
+        self.build_model(func=model_func, trainable=self.trainable)
+
+    def build_model(self, func=None, trainable=True):
+        if func:
+            self.model_func_name = func.__name__
+            def model(inputs, train, **kwargs):
+                call_params = kwargs
+                call_params.update(self.params)
+                if trainable:
+                    return func(inputs, train=train, **call_params)
+                else:
+                    return func(inputs, **call_params)
+
+        else:
+            self.model_func_name = 'passthrough'
+            def model(inputs, train, **kwargs):
+                return inputs
+
+        self.model_func = model
+
+    def __call__(self, inputs, train=True, **kwargs):
+
+        with tf.compat.v1.variable_scope(self.name):
+            outputs = self.model_func(inputs, train=train, **kwargs)
+        return outputs
+
+class Loss(object):
+    '''
+    Abstract loss class
+    '''
+    def __init__(
+            self, name, required_decoders=[],
+            loss_func=l2_loss, scale=1.0,
+            logits_keys=None,
+            labels_keys=None,
+            **kwargs
+    ):
+        self.loss_type = type(self).__name__
+        self.required_decoders = required_decoders
+        self.name = name
+        self.scale = scale
+        self.logits_keys = logits_keys
+        self.labels_keys = labels_keys
+        self.params = copy.deepcopy(kwargs)
+
+        self.build_loss_func(func=loss_func)
+
+    def build_loss_func(self, func):
+
+        self.loss_func_name = func.__name__
+
+        def loss_func(logits, labels, valid_logits=None, valid_labels=None, labels_first=True, **kwargs):
+            _logits = self.get_logits(logits, valid_logits)
+            _labels = self.get_labels(labels, valid_labels)
+            loss_params = kwargs
+            loss_params.update(self.params)
+            if isinstance(_logits, dict) and isinstance(_labels, dict):
+                loss_params.update(_logits)
+                loss_params.update(_labels)
+                loss_tensor = func(**loss_params)
+            elif isinstance(_logits, list) and isinstance(_labels, list):
+                loss_inputs = _labels + _logits if labels_first else _logits + _labels
+                loss_tensor = func(*loss_inputs, **loss_params)
+            elif isinstance(_logits, tf.Tensor) and isinstance(_labels, tf.Tensor):
+                loss_inputs = [_labels, _logits] if labels_first else [_logits, _labels]
+                loss_tensor = func(*loss_inputs, **loss_params)
+            else:
+                raise TypeError("logits and labels must both be either lists or dicts or tensors")
+
+            loss_mask = self.get_loss_mask(
+                loss_tensor, valid_logits, valid_labels, **loss_params)
+            loss_scalar = self.reduce_loss_tensor(loss_tensor, loss_mask, **loss_params)
+            return loss_scalar
+
+        self.loss_func = loss_func
+
+    def get_logits(self, logits, valid_logits):
+        if self.logits_keys:
+            return {k:logits[k] for k in self.logits_keys}
+        else:
+            return logits
+
+    def get_labels(self, labels, valid_labels):
+        if self.labels_keys:
+            return {k:labels[k] for k in self.labels_keys}
+        else:
+            return labels
+
+    def get_loss_mask(self, loss_tensor, valid_logits=None, valid_labels=None, **kwargs):
+
+        valid_logits = valid_logits or tf.ones_like(loss_tensor)
+        valid_labels = valid_labels or tf.ones_like(loss_tensor)
+        loss_mask = tf.logical_and(valid_logits > 0.5, valid_labels > 0.5)
+        loss_mask = tf.cast(loss_mask, tf.float32)
+        return loss_mask
+
+    def reduce_loss_tensor(self, loss_tensor, loss_mask, mean_across_dims=[0,1], **kwargs):
+
+        shape = loss_tensor.shape.as_list()
+        rank = len(shape)
+        sum_dims = [d for d in range(rank) if d not in mean_across_dims]
+        num_valid = tf.reduce_sum(loss_mask, axis=sum_dims, keepdims=True) # e.g. [B,T,1,1]
+        loss = tf.reduce_sum(loss_tensor, axis=sum_dims, keepdims=True) / tf.maximum(1., num_valid)
+        loss_scalar = tf.reduce_mean(loss)
+        return loss_scalar
+
+    def __call__(self, outputs, labels,
+                 valid_logits=None, valid_labels=None,
+                 logits_mapping={'logits': 'classifier/outputs'},
+                 labels_mapping={'labels': 'labels'},
+                 suffix='', **kwargs
+    ):
+
+        logits = {k: outputs[logits_mapping[k]] for k in logits_mapping.keys()}
+        labels_here = {k: labels[labels_mapping[k]] for k in labels_mapping.keys()}
+        loss = self.loss_func(logits, labels_here, valid_logits, valid_labels, **kwargs)
+        loss *= self.scale
+        loss_nm = self.name + ('_' + suffix if len(suffix) else '')
+        return {loss_nm: loss}
